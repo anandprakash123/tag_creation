@@ -1,0 +1,510 @@
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  DOCKER_HOST: tcp://docker:2375/
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  GIT_SUBMODULE_STRATEGY: recursive
+  FF_NETWORK_PER_BUILD: 1
+  GITLAB_NPM_TOKEN: $CI_JOB_TOKEN
+
+include:
+  - local: '.gitlab/dependabot-scheduled.yml'
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .cache/pip
+    - ui/node_modules
+
+stages:
+  - build
+  - test
+  - "build and release"
+  - "template validation"
+  - "staging deployment"
+  - "test suite"
+  - golive
+  - "production deployment"
+
+app:
+  stage: build
+  image: node:14
+  before_script:
+    - cd ui
+  script:
+    - make
+  artifacts:
+    paths:
+      - portal/static/dist/
+  except:
+        - master
+        - production
+
+frontend:
+  stage: test
+  image: node:14
+  before_script:
+    - cd ui
+    - npm ci
+  script:
+    - sh ../scripts/pipeline/test_ui.sh
+  except:
+        - master
+        - production
+
+backend:
+  stage: test
+  image: registry.gitlab.com/sparkmeter/infrastructure/portal-base-images/python:3.9
+  variables:
+    POSTGRES_DB: portal
+    POSTGRES_USER: portal_user
+    POSTGRES_PASSWORD: portal_password
+    KAFKA_URI: ""
+    AWS_ACCESS_KEY_ID: ""
+    AWS_SECRET_ACCESS_KEY: ""
+    DATA_EXPORTS_S3_BUCKET: ""
+  services:
+    - name: postgres:11.3
+      alias: postgres_portal
+    - name: postgres:11.3
+      alias: postgres_fdw
+    - name: postgres:9.5
+      alias: postgres_assets_test_db
+    - redis:5.0.7
+  before_script:
+    - psql --version
+    - pip install -r requirements.txt
+    - pip install dependency/slipstreamj-1.16.0-cp39-cp39-linux_x86_64.whl
+    - pip install dependency/sparkmac-1.32.1-py3-none-any.whl
+    - pip install .[dev]
+    - export PGPASSWORD=${POSTGRES_PASSWORD}
+    - createdb -O ${POSTGRES_USER} -h postgres_assets_test_db -p5432 -w -U ${POSTGRES_USER} thundercloud_test_db1
+    - createdb -O ${POSTGRES_USER} -h postgres_assets_test_db -p5432 -w -U ${POSTGRES_USER} thundercloud_test_db2
+    - createdb -O ${POSTGRES_USER} -h postgres_assets_test_db -p5432 -w -U ${POSTGRES_USER} gladys_dev
+    - export PORTAL_DB_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_portal:5432/${POSTGRES_DB}
+    - export PORTAL_FDW_DB_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_fdw:5432/${POSTGRES_DB}
+    - export THUNDERCLOUD_TEST_DB1_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_assets_test_db:5432/thundercloud_test_db1
+    - export THUNDERCLOUD_TEST_DB2_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_assets_test_db:5432/thundercloud_test_db2
+    - export GLADYS_DB_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_assets_test_db:5432/gladys_dev
+    - export ELASTICSEARCH_URI="http://localhost:9200"
+    - export RATELIMIT_STORAGE_HOST=redis
+    - export RATELIMIT_STORAGE_PORT=6379
+  script:
+    - black --check portal/
+    - mypy -p portal
+    - pylint portal
+    - isort portal -c
+    - PYTHONPATH=. alembic -x data=true upgrade head
+    - PYTHONPATH=. alembic -x data=true downgrade base
+    - pytest
+    - coverage xml
+    - python ./scripts/validate_coverage.py --python coverage.xml
+  except:
+      - master
+      - production
+      - schedules
+      - tags
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+  artifacts:
+    when: always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+      junit: report.xml
+
+# Conditional block for MR-specific jobs
+include:
+  - template: Security/SAST.gitlab-ci.yml
+
+semgrep-sast:
+  rules:
+    - if: $CI_PIPELINE_SOURCE == 'merge_request_event'
+      exists:
+         - '**/*.go'
+         - '**/*.html'
+         - '**/*.js'
+         - '**/*.jsx'
+         - '**/*.ts'
+         - '**/*.tsx'
+
+build:
+  stage: "build and release"
+  image: node:14
+  before_script:
+    - cd ui
+  script:
+    - make
+  artifacts:
+    paths:
+      - portal/static/dist/
+  only:
+        - master
+        - production
+
+stg_release:
+  stage: "build and release"
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  script:
+    - sh ./scripts/pipeline/release.sh
+    - make
+    - VERSION=$(./scripts/next_version.sh)
+    - NEW_VERSION=$(./scripts/pipeline/new_version.sh)
+    - echo $NEW_VERSION
+    - echo $NEW_VERSION > version_file
+    - cat version_file
+    - git tag -a $NEW_VERSION -m "Release $NEW_VERSION"
+    - git push gitlab --tags
+    - LAST_VERSION=$(./scripts/pipeline/old_version.sh)
+    - echo $LAST_VERSION
+    - echo $LAST_VERSION > version_rollback_file
+    - cat version_rollback_file
+    - docker image tag $CI_REGISTRY_IMAGE:$VERSION $CI_REGISTRY_IMAGE:$NEW_VERSION
+    - docker push $CI_REGISTRY_IMAGE:$NEW_VERSION
+    - SENTRY_VERSION="portal@${NEW_VERSION#v}"
+    - docker run --rm -v $(pwd):/work -e SENTRY_AUTH_TOKEN getsentry/sentry-cli releases --org sparkmeter new -p koios-prod $SENTRY_VERSION
+    - docker run --rm -v $(pwd):/work -e SENTRY_AUTH_TOKEN getsentry/sentry-cli releases --org sparkmeter set-commits --auto $SENTRY_VERSION
+  artifacts:
+    paths:
+      - version_file
+      - version_rollback_file
+  only:
+    - master
+  except:
+    - schedules
+  needs: ["build"]
+  allow_failure: true
+
+prod_release:
+  stage: "build and release"
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  script:
+    - sh ./scripts/pipeline/release.sh
+    - make
+    - VERSION=$(./scripts/next_version.sh)
+    - NEW_VERSION=$(./scripts/pipeline/new_version.sh)
+    - echo $NEW_VERSION
+    - echo $NEW_VERSION > version_file
+    - cat version_file
+    - git tag -a $NEW_VERSION -m "Release $NEW_VERSION"
+    - git push gitlab --tags
+    - LAST_VERSION=$(./scripts/pipeline/old_version.sh)
+    - echo $LAST_VERSION
+    - echo $LAST_VERSION > version_rollback_file
+    - cat version_rollback_file
+    - docker image tag $CI_REGISTRY_IMAGE:$VERSION $CI_REGISTRY_IMAGE:$NEW_VERSION
+    - docker push $CI_REGISTRY_IMAGE:$NEW_VERSION
+    - SENTRY_VERSION="portal@${NEW_VERSION#v}"
+    - docker run --rm -v $(pwd):/work -e SENTRY_AUTH_TOKEN getsentry/sentry-cli releases --org sparkmeter new -p koios-prod $SENTRY_VERSION
+    - docker run --rm -v $(pwd):/work -e SENTRY_AUTH_TOKEN getsentry/sentry-cli releases --org sparkmeter set-commits --auto $SENTRY_VERSION
+  artifacts:
+    paths:
+      - version_file
+      - version_rollback_file
+  only:
+    - production
+  except:
+    - schedules
+  when: manual
+  allow_failure: true
+
+.validate_nomad: &validate_nomad1
+  stage: "template validation"
+  needs: ["stg_release"]
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  script:
+    - sh ./scripts/pipeline/nomad_build.sh
+  artifacts:
+    paths:
+      - nomad/*.nomad
+  only:
+    - master
+    - production
+  except:
+    - schedules
+
+.validate_nomad: &validate_nomad
+  stage: "template validation"
+  needs: ["prod_release"]
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  script:
+    - sh ./scripts/pipeline/nomad_build.sh
+  artifacts:
+    paths:
+      - nomad/*.nomad
+  only:
+    - master
+    - production
+    - KOI-1311-pipeline-changes
+  except:
+    - schedules
+
+staging:
+  <<: *validate_nomad1
+  variables:
+    NOMAD_ADDR: "https://nomad.staging.spk.io"
+    ENV_NAME: staging
+  only:
+    - master
+production:
+  <<: *validate_nomad
+  variables:
+    NOMAD_ADDR: "https://nomad.prod.spk.io"
+    ENV_NAME: prod
+  only:
+    - production
+
+staging_db_migration:
+  stage: "staging deployment"
+  dependencies:
+    - stg_release
+    - staging
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.staging.spk.io"
+    ENV_NAME: staging
+    BUCKET_NAME: sparkmeter-db-revision
+  script:
+    # Stop the job so this stage can be re-run if needed
+    - nomad job stop koios-migrator || true
+    - nomad alloc exec -job koios alembic current |awk '{print $1}'| tee ${ENV_NAME}-db-version.txt
+    - nomad alloc exec -job koios alembic --name fdw_migration current |awk '{print $1}'| tee ${ENV_NAME}-fdw-version.txt
+    - nomad job run ./nomad/koios-migrator-${ENV_NAME}.nomad
+  artifacts:
+    paths:
+      - ${ENV_NAME}-db-version.txt
+      - ${ENV_NAME}-fdw-version.txt
+  only:
+    - master
+  except:
+    - schedules
+  
+.deploy:
+  script: &deploy
+    - sh ./scripts/pipeline/deploy.sh
+
+staging_deployment:
+  stage: "staging deployment"
+  dependencies:
+    - stg_release
+    - staging
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.staging.spk.io"
+    ENV_NAME: staging
+  script: *deploy
+  only:
+    - master
+  except:
+    - schedules
+  environment:
+    name: stg
+    url: https://portal.staging.spk.io
+
+staging_portal_db_rollback:
+  stage: "staging deployment"
+  needs:
+    - stg_release
+    - staging
+    - staging_db_migration
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.staging.spk.io"
+    ENV_NAME: staging
+    BUCKET_NAME: sparkmeter-db-revision
+  script:
+    - export PREVIOUS_VERSION=`cat ${ENV_NAME}-db-version.txt`
+    - nomad alloc exec -job koios alembic -x data=true downgrade $PREVIOUS_VERSION
+  only:
+    - master
+  except:
+    - schedules
+  when: manual
+
+staging_fdw_db_rollback:
+  stage: "staging deployment"
+  needs:
+    - staging_db_migration
+    - stg_release
+    - staging
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.staging.spk.io"
+    ENV_NAME: staging
+    BUCKET_NAME: sparkmeter-db-revision
+  script:
+    - export PREVIOUS_VERSION=`cat ${ENV_NAME}-fdw-version.txt`
+    - nomad alloc exec -job koios alembic --name fdw_migration -x data=true downgrade $PREVIOUS_VERSION
+  only:
+    - master
+  except:
+    - schedules
+  when: manual
+
+staging_rollback_deployment:
+  stage: "staging deployment"
+  dependencies:
+    - stg_release
+    - staging
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.staging.spk.io"
+    ENV_NAME: staging
+  script: 
+    - export PORTAL_VERSION=$(cat version_rollback_file)
+    - echo "Deploying ${PORTAL_VERSION} to ${ENV_NAME}"
+    - nomad job run ./nomad/koios-rollback-${ENV_NAME}.nomad
+  only:
+    - master
+  except:
+    - schedules
+  when: manual
+  environment:
+    name: stg
+    url: https://portal.staging.spk.io
+
+production_portal_db_rollback:
+  stage: "production deployment"
+  dependencies:
+    - prod_release
+    - production
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.prod.spk.io"
+  script:
+    # Stop the job so this stage can be re-run if needed
+    - apt-get update
+    - apt-get install -y awscli
+    - aws s3 cp s3://${BUCKET_NAME}/${ENV_NAME}-db-version.txt ${ENV_NAME}-db-version.txt
+    - export PREVIOUS_VERSION=`cat ${ENV_NAME}-db-version.txt`
+    - nomad alloc exec -job koios alembic -x data=true downgrade $PREVIOUS_VERSION
+  only:
+    - production
+  except:
+    - schedules
+  when: manual
+
+production_portal_fdw_rollback:
+  stage: "production deployment"
+  dependencies:
+    - prod_release
+    - production
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.prod.spk.io"
+  script:
+    - apt-get update
+    - apt-get install -y awscli
+    - aws s3 cp s3://${BUCKET_NAME}/${ENV_NAME}-fdw-version.txt ${ENV_NAME}-fdw-version.txt
+    - export PREVIOUS_VERSION=`cat ${ENV_NAME}-fdw-version.txt`
+    - nomad alloc exec -job koios alembic --name fdw_migration -x data=true downgrade $PREVIOUS_VERSION
+  only:
+    - production
+  except:
+    - schedules
+  when: manual
+
+production_rollback_deployment:
+  stage: "production deployment"
+  dependencies:
+    - prod_release
+    - production
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.prod.spk.io"
+    ENV_NAME: prod
+  script: 
+    - export PORTAL_VERSION=$(cat version_rollback_file)
+    - echo "Deploying ${PORTAL_VERSION} to ${ENV_NAME}"
+    - nomad job run ./nomad/koios-rollback-${ENV_NAME}.nomad
+  only:
+    - production
+  except:
+    - schedules
+  when: manual
+  environment:
+    name: prod
+    url: https://sparkmeter.cloud
+
+staging_test_suite:
+  stage: "test suite"
+  needs: [ "staging_deployment" ]
+  variables:
+    STAGING_DEPLOYED: 1
+  # This is a pipeline job, thus the use of
+  # `trigger`
+  trigger:
+    project: sparkmeter/koios-api-tests
+    branch: master
+    strategy: depend
+  only:
+    - master
+  except:
+    - schedules
+
+golive:
+  stage: golive
+  image: docker:stable
+  services:
+    - docker:dind
+  script:
+    - ./scripts/pipeline/fast_forward_merge.sh
+  when: manual
+  only:
+    - master
+
+production_db_migration:
+  stage: "production deployment"
+  dependencies:
+    - prod_release
+    - production
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.prod.spk.io"
+  script:
+    # Stop the job so this stage can be re-run if needed
+    - nomad job stop koios-migrator || true
+    - nomad job run ./nomad/koios-migrator-prod.nomad
+  only:
+    - production
+  except:
+    - schedules
+  when: manual
+
+production_deployment:
+  stage: "production deployment"
+  dependencies:
+    - prod_release
+    - production
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.prod.spk.io"
+    ENV_NAME: prod
+  script: *deploy
+  only:
+    - production
+  except:
+    - schedules
+  when: manual
+  environment:
+    name: prd
+    url: https://sparkmeter.cloud
+
+deploy:prod:finalize:
+  stage: .post
+  image: getsentry/sentry-cli
+  needs: ["prod_release", "production_deployment"]
+  dependencies:
+    - prod_release
+  script:
+    - VERSION=$(cat version_file)
+    - SENTRY_VERSION="portal@${VERSION#v}"
+    - sentry-cli releases --org sparkmeter finalize $SENTRY_VERSION
+  only:
+    - production
+  except:
+    - schedules

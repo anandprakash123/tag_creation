@@ -1,0 +1,55 @@
+[[ if empty $.portal_version ]][[ fail "No version set" ]][[ end -]]
+job "koios-migrator" {
+  datacenters = ["us-east-1"]
+
+  type = "batch"
+
+  group "runner" {
+    count = 1
+
+    task "script" {
+      driver = "docker"
+
+      vault {
+        policies = [
+          "policy.aws.iam.[[ .environment.long_name ]].users.portal.read",
+          "policy.service.[[ .environment.long_name ]].portal.read",
+        ]
+      }
+
+      config {
+        image   = "registry.gitlab.com/sparkmeter/portal:[[ $.portal_version ]]"
+        command = "scripts/pipeline/rollback_migrate_fdw.sh"
+
+        logging {
+          type = "syslog"
+
+          config {
+            syslog-address = "tcp+tls://logs4.papertrailapp.com:38326"
+            tag            = "koios-migrator-[[ .environment.short_name ]]"
+          }
+        }
+      }
+
+      template {
+        data = <<-EOH
+          [[ fileContents "nomad/koios-common.env" ]]
+          [[ list "nomad/koios-" .environment.short_name ".env" | join "" | fileContents ]]
+        EOH
+
+        destination = "secrets/file.env"
+        env         = true
+      }
+
+      template {
+        data = <<-EOH
+          DB_MIGRATION_STATEMENT_TIMEOUT="{{ key "service/portal/db_migration_statement_timeout" }}"
+          DB_MIGRATION_LOCK_TIMEOUT="{{ key "service/portal/db_migration_lock_timeout" }}"
+        EOH
+
+        destination = "local/file.env"
+        env         = true
+      }
+    }
+  }
+}

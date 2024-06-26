@@ -1,0 +1,443 @@
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  DOCKER_HOST: tcp://docker:2375/
+  DOCKER_DRIVER: overlay2
+  DOCKER_TLS_CERTDIR: ""
+  GIT_SUBMODULE_STRATEGY: recursive
+  FF_NETWORK_PER_BUILD: 1
+  GITLAB_NPM_TOKEN: $CI_JOB_TOKEN
+
+include:
+  - local: '.gitlab/dependabot-scheduled.yml'
+
+cache:
+  key: ${CI_COMMIT_REF_SLUG}
+  paths:
+    - .cache/pip
+    - ui/node_modules
+
+stages:
+  - test
+  - build
+  - e2e
+  - release
+  - nomad_build
+  - staging_migration
+  - staging_deploy
+  - staging_deploy_api_test_ext
+  - staging-prod_deploy
+  - staging-prod_deploy_reset
+  - staging-prod_deploy_test
+  - prod_migration
+  - prod_deploy
+
+test:ui:
+  stage: test
+  image: node:14
+  before_script:
+    - cd ui
+    - npm ci
+  script:
+    - npm run lint:ci
+    - npm run test:unit
+  except:
+    - schedules
+    - tags
+
+test:app:
+  stage: test
+  image: registry.gitlab.com/sparkmeter/infrastructure/portal-base-images/python:3.9
+  variables:
+    POSTGRES_DB: portal
+    POSTGRES_USER: portal_user
+    POSTGRES_PASSWORD: portal_password
+    KAFKA_URI: ""
+    AWS_ACCESS_KEY_ID: ""
+    AWS_SECRET_ACCESS_KEY: ""
+    DATA_EXPORTS_S3_BUCKET: ""
+  services:
+    - name: postgres:11.3
+      alias: postgres_portal
+    - name: postgres:11.3
+      alias: postgres_fdw
+    - name: postgres:9.5
+      alias: postgres_assets_test_db
+    - redis:5.0.7
+  before_script:
+    - psql --version
+    - pip install -r requirements.txt
+    - pip install dependency/slipstreamj-1.16.0-cp39-cp39-linux_x86_64.whl
+    - pip install dependency/sparkmac-1.32.1-py3-none-any.whl
+    - pip install .[dev]
+    - export PGPASSWORD=${POSTGRES_PASSWORD}
+    - createdb -O ${POSTGRES_USER} -h postgres_assets_test_db -p5432 -w -U ${POSTGRES_USER} thundercloud_test_db1
+    - createdb -O ${POSTGRES_USER} -h postgres_assets_test_db -p5432 -w -U ${POSTGRES_USER} thundercloud_test_db2
+    - createdb -O ${POSTGRES_USER} -h postgres_assets_test_db -p5432 -w -U ${POSTGRES_USER} gladys_dev
+    - export PORTAL_DB_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_portal:5432/${POSTGRES_DB}
+    - export PORTAL_FDW_DB_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_fdw:5432/${POSTGRES_DB}
+    - export THUNDERCLOUD_TEST_DB1_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_assets_test_db:5432/thundercloud_test_db1
+    - export THUNDERCLOUD_TEST_DB2_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_assets_test_db:5432/thundercloud_test_db2
+    - export GLADYS_DB_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_assets_test_db:5432/gladys_dev
+    - export ELASTICSEARCH_URI="http://localhost:9200"
+    - export RATELIMIT_STORAGE_HOST=redis
+    - export RATELIMIT_STORAGE_PORT=6379
+  script:
+    - black --check portal/
+    - mypy -p portal
+    - pylint portal
+    - isort portal -c
+    - PYTHONPATH=. alembic -x data=true upgrade head
+    - PYTHONPATH=. alembic -x data=true downgrade base
+    - pytest
+    - coverage xml
+    - python ./scripts/validate_coverage.py --python coverage.xml
+  except:
+    - schedules
+    - tags
+  coverage: '/(?i)total.*? (100(?:\.0+)?\%|[1-9]?\d(?:\.\d+)?\%)$/'
+  artifacts:
+    when: always
+    reports:
+      coverage_report:
+        coverage_format: cobertura
+        path: coverage.xml
+      junit: report.xml
+
+# test:e2e:
+#   stage: e2e
+#   image: registry.gitlab.com/sparkmeter/infrastructure/portal-base-images/e2e:latest
+#   variables:
+#     SECRET_KEY: sparkmeter
+#     POSTGRES_DB: portal
+#     POSTGRES_USER: portal_user
+#     POSTGRES_PASSWORD: portal_password
+#     ELASTICSEARCH_URI: 'http://elasticsearch:9200'
+#     CYPRESS_BASE_URL: 'http://localhost:80'
+#     PORTAL_COOKIE_DOMAIN: none
+#     RATELIMIT_STORAGE_URL: redis://redis:6379
+#     EARLY_ACCESS_WHITELIST: ''
+#     GLADYS_API_URL: http://gladys.spk.test/v1  # Added to satisfy Gladys API client inits
+#     SKIP_NOVA: 1
+#   services:
+#     - name: docker:dind
+#     - name: postgres:11.3
+#       alias: postgres_portal
+#     - name: postgres:11.3
+#       alias: postgres_fdw
+#     - name: postgres:9.5
+#       alias: db
+#     - redis:5.0.7
+#   before_script:
+#     - mkdir ~/.docker && echo "$DOCKER_AUTH_CONFIG" > ~/.docker/config.json
+#     - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+#     - docker pull $CI_REGISTRY_IMAGE/cypress:latest || true
+#     - cd ui
+#     - docker build --cache-from $CI_REGISTRY_IMAGE/cypress:latest -f ../docker/Dockerfile.cypress -t cypresstest -t $CI_REGISTRY_IMAGE/cypress:latest .
+#     - docker push $CI_REGISTRY_IMAGE/cypress:latest
+#     - cd -
+#     - export PORTAL_DB_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_portal:5432/${POSTGRES_DB}
+#     - export PORTAL_FDW_DB_URI=postgresql://${POSTGRES_USER}:${POSTGRES_PASSWORD}@postgres_fdw:5432/${POSTGRES_DB}
+#     - export DOCKER_E2E=${GITLAB_CI}
+#   script:
+#     - export PGPASSWORD=${POSTGRES_PASSWORD}
+#     - ./docker/postgres-scripts/init-thundercloud-databases.sh "-h postgres_portal"
+#     - make
+#     - export VERSION=$(./scripts/next_version.sh)
+#     - |
+#       export DOCKER_IMAGE_ID=$(docker run --name=portal \
+#         -e SECRET_KEY \
+#         -e PORTAL_COOKIE_DOMAIN \
+#         -e ELASTICSEARCH_URI \
+#         -e PORTAL_DB_URI \
+#         -e PORTAL_FDW_DB_URI \
+#         -e RATELIMIT_STORAGE_URL \
+#         -e EARLY_ACCESS_WHITELIST \
+#         -e SKIP_NOVA \
+#         --network="host" -d --rm $CI_REGISTRY_IMAGE:$VERSION)
+#     - ./scripts/init-demo-db.sh
+#     - ./scripts/run_e2e.sh
+#     - export EXIT_CODE=$?
+#     - docker logs $DOCKER_IMAGE_ID > dockerlog.log 2>&1
+#     - docker kill $DOCKER_IMAGE_ID
+#     - exit $EXIT_CODE
+#   artifacts:
+#     when: always
+#     expire_in: "2 weeks"
+#     paths:
+#       - ui/e2e/cypress/videos/
+#       - ui/e2e/cypress/screenshots/
+#       - dockerlog.log
+#   except:
+#     - schedules
+#     - tags
+
+build:ui:
+  stage: build
+  needs: ["test:ui"]
+  image: node:14
+  before_script:
+    - cd ui
+  script:
+    - make
+  artifacts:
+    paths:
+      - portal/static/dist/
+  except:
+    - schedules
+    - tags
+
+release:
+  stage: release
+  image: docker:24.0.5
+  services:
+    - docker:24.0.5-dind
+  before_script:
+    - mkdir ~/.docker && echo "$DOCKER_AUTH_CONFIG" > ~/.docker/config.json
+    - apk update
+    - apk add bash git make
+    - docker login -u gitlab-ci-token -p $CI_JOB_TOKEN $CI_REGISTRY
+    - git config --global user.email "machine@sparkmeter.io"
+    - git config --global user.name "SparkMeter Machine"
+    - git remote rm gitlab || true
+    - git remote add gitlab https://sm-machine:${MACHINE_ACCESS_TOKEN}@gitlab.com/${CI_PROJECT_PATH}.git
+    - git remote -v
+  script:
+    - make
+    - VERSION=$(./scripts/next_version.sh)
+    - echo $VERSION
+    - echo $VERSION > version_file
+    - git tag -a $VERSION -m "Release $VERSION"
+    - git push gitlab --tags
+    - docker push $CI_REGISTRY_IMAGE:$VERSION
+    - SENTRY_VERSION="portal@${VERSION#v}"
+    - docker run --rm -v $(pwd):/work -e SENTRY_AUTH_TOKEN getsentry/sentry-cli releases --org sparkmeter new -p koios-prod $SENTRY_VERSION
+    - docker run --rm -v $(pwd):/work -e SENTRY_AUTH_TOKEN getsentry/sentry-cli releases --org sparkmeter set-commits --auto $SENTRY_VERSION
+  dependencies:
+    - build:ui
+  artifacts:
+    paths:
+      - version_file
+  only:
+    - master
+  except:
+    - schedules
+  when: manual
+  allow_failure: true
+
+.build_nomad: &build_nomad
+  stage: nomad_build
+  needs: ["release"]
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  script:
+    - export PORTAL_VERSION=$(cat version_file)
+    - echo "Building ${ENV_NAME} Nomad manifests for ${PORTAL_VERSION}"
+    - levant render -var-file=nomad/koios-${ENV_NAME}.vars.yaml -var="portal_version=${PORTAL_VERSION}" -out=nomad/koios-${ENV_NAME}.nomad nomad/koios-app.nomad.template
+    - levant render -var-file=nomad/koios-${ENV_NAME}.vars.yaml -var="portal_version=${PORTAL_VERSION}" -out=nomad/koios-alert-consumer-${ENV_NAME}.nomad nomad/koios-alert-consumer.nomad.template
+    - levant render -var-file=nomad/koios-${ENV_NAME}.vars.yaml -var="portal_version=${PORTAL_VERSION}" -out=nomad/koios-alert-pruner-${ENV_NAME}.nomad nomad/koios-alert-pruner.nomad.template
+    - levant render -var-file=nomad/koios-${ENV_NAME}.vars.yaml -var="portal_version=${PORTAL_VERSION}" -out=nomad/koios-data-export-scraper-${ENV_NAME}.nomad nomad/koios-data-export-scraper.nomad.template
+    - levant render -var-file=nomad/koios-${ENV_NAME}.vars.yaml -var="portal_version=${PORTAL_VERSION}" -out=nomad/koios-data-export-scraper-load-organization-${ENV_NAME}.nomad nomad/koios-data-export-scraper-load-organization.nomad.template
+    - levant render -var-file=nomad/koios-${ENV_NAME}.vars.yaml -var="portal_version=${PORTAL_VERSION}" -out=nomad/koios-migrator-${ENV_NAME}.nomad nomad/koios-migrator.nomad.template
+    - nomad job validate ./nomad/koios-${ENV_NAME}.nomad
+    - nomad job validate ./nomad/koios-alert-consumer-${ENV_NAME}.nomad
+    - nomad job validate ./nomad/koios-alert-pruner-${ENV_NAME}.nomad
+    - nomad job validate ./nomad/koios-data-export-scraper-${ENV_NAME}.nomad
+    - nomad job validate ./nomad/koios-data-export-scraper-load-organization-${ENV_NAME}.nomad
+    - nomad job validate ./nomad/koios-migrator-${ENV_NAME}.nomad
+  artifacts:
+    paths:
+      - nomad/*.nomad
+  only:
+    - master
+  except:
+    - schedules
+
+build:nomad:staging:
+  <<: *build_nomad
+  variables:
+    NOMAD_ADDR: "https://nomad.staging.spk.io"
+    ENV_NAME: staging
+
+build:nomad:prod:
+  <<: *build_nomad
+  variables:
+    NOMAD_ADDR: "https://nomad.prod.spk.io"
+    ENV_NAME: prod
+
+migrate:staging:
+  stage: staging_migration
+  dependencies:
+    - release
+    - build:nomad:staging
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.staging.spk.io"
+  script:
+    # Stop the job so this stage can be re-run if needed
+    - nomad job stop koios-migrator || true
+    - nomad job run ./nomad/koios-migrator-staging.nomad
+  only:
+    - master
+  except:
+    - schedules
+  when: manual
+
+.deploy:
+  script: &deploy
+    - export PORTAL_VERSION=$(cat version_file)
+    - echo "Deploying ${PORTAL_VERSION} to ${ENV_NAME}"
+    - nomad job run ./nomad/koios-${ENV_NAME}.nomad
+    - nomad job run ./nomad/koios-alert-consumer-${ENV_NAME}.nomad
+    - nomad run ./nomad/koios-alert-pruner-${ENV_NAME}.nomad
+    - nomad job run ./nomad/koios-data-export-scraper-${ENV_NAME}.nomad
+    - nomad job run ./nomad/koios-data-export-scraper-load-organization-${ENV_NAME}.nomad
+
+deploy:staging:
+  stage: staging_deploy
+  dependencies:
+    - release
+    - build:nomad:staging
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.staging.spk.io"
+    ENV_NAME: staging
+  script: *deploy
+  only:
+    - master
+  except:
+    - schedules
+  when: manual
+  environment:
+    name: stg
+    url: https://portal.staging.spk.io
+
+deploy:staging:test:api:
+  stage: staging_deploy_api_test_ext
+  needs: [ "deploy:staging" ]
+  variables:
+    STAGING_DEPLOYED: 1
+  # This is a pipeline job, thus the use of
+  # `trigger`
+  trigger:
+    project: sparkmeter/koios-api-tests
+    branch: master
+    strategy: depend
+  only:
+    - master
+  except:
+    - schedules
+
+deploy:staging-prod:
+  stage: staging-prod_deploy
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4
+  variables:
+    NOMAD_ADDR: "https://nomad.prod.spk.io"
+  script:
+    - export CI_COMMIT_TAG=$(cat version_file)
+    - echo "Deploying ${CI_COMMIT_TAG}"
+    - envsubst '${CI_COMMIT_TAG}' < ./nomad/koios-staging-prod.nomad.template > ./nomad/koios-staging-prod.nomad
+    - nomad job validate ./nomad/koios-staging-prod.nomad
+    - nomad job run ./nomad/koios-staging-prod.nomad
+    - TARGET_ALLOC_ID=$(nomad status koios-staging | awk '{ if($0 == "Allocations") { getline; getline; if($5 == "run") { print $1 } } }')
+    - echo "export TARGET_ALLOC_ID=${TARGET_ALLOC_ID}" > alloc.env
+  only:
+    - master
+  except:
+    - schedules
+  artifacts:
+    paths:
+      - alloc.env
+  when: manual
+  environment:
+    name: stg-prd
+    url: https://koios.prod.spk.io
+
+deploy:staging-prod:reset:
+  stage: staging-prod_deploy_reset
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4
+  variables:
+    NOMAD_ADDR: "https://nomad.prod.spk.io"
+    SKIP_SITE_FDW_INIT: 1
+  needs: ["deploy:staging-prod"]
+  script:
+    - ./scripts/reset_staging.sh
+  only:
+    - master
+  except:
+    - schedules
+
+deploy:staging-prod:test:
+  stage: staging-prod_deploy_test
+  image: cypress/browsers:node12.13.0-chrome80-ff74
+  needs: ["deploy:staging-prod:reset"]
+  variables:
+    CYPRESS_BASE_URL: https://koios.prod.spk.io
+    SKIP_SITE_FDW_INIT: 1
+  before_script:
+    - cd ui
+    - npm ci
+    - cd ..
+  script:
+    - ./scripts/run_e2e.sh
+  artifacts:
+    when: always
+    expire_in: "2 weeks"
+    paths:
+      - ui/e2e/cypress/videos/
+      - ui/e2e/cypress/screenshots/
+  only:
+    - master
+  except:
+    - schedules
+
+migrate:prod:
+  stage: prod_migration
+  dependencies:
+    - release
+    - build:nomad:prod
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.prod.spk.io"
+  script:
+    # Stop the job so this stage can be re-run if needed
+    - nomad job stop koios-migrator || true
+    - nomad job run ./nomad/koios-migrator-prod.nomad
+  only:
+    - master
+  except:
+    - schedules
+  when: manual
+
+deploy:prod:
+  stage: prod_deploy
+  dependencies:
+    - release
+    - build:nomad:prod
+  image: registry.gitlab.com/sparkmeter/infrastructure/docker_nomad_deploy:1.0.4-levant0.3.0
+  variables:
+    NOMAD_ADDR: "https://nomad.prod.spk.io"
+    ENV_NAME: prod
+  script: *deploy
+  only:
+    - master
+  except:
+    - schedules
+  when: manual
+  environment:
+    name: prd
+    url: https://sparkmeter.cloud
+
+deploy:prod:finalize:
+  stage: .post
+  image: getsentry/sentry-cli
+  needs: ["release", "deploy:prod"]
+  dependencies:
+    - release
+  script:
+    - VERSION=$(cat version_file)
+    - SENTRY_VERSION="portal@${VERSION#v}"
+    - sentry-cli releases --org sparkmeter finalize $SENTRY_VERSION
+  only:
+    - master
+  except:
+    - schedules
+
